@@ -149,7 +149,8 @@ class VolkswagenConnectConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None and self._portal is not None:
             try:
                 await self._portal.submit_otp(user_input[CONF_OTP].strip())
-            except Exception:  # noqa: BLE001 - surface as a retryable OTP error
+            except Exception as err:  # noqa: BLE001 - surface as a retryable OTP error
+                _LOGGER.warning("Website portal OTP step failed: %s", err)
                 errors["base"] = "invalid_otp"
             else:
                 self._portal_ready = True
