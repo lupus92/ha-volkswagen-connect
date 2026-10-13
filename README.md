@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="images/icon.png" alt="Volkswagen Connect" width="128" height="128">
+  <img src="custom_components/volkswagen_connect/brand/icon.png" alt="Volkswagen Connect" width="128" height="128">
 </p>
 
 # Volkswagen Connect — Home Assistant integration
