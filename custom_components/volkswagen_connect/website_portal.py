@@ -64,6 +64,9 @@ MAX_REDIRECTS = 30
 # login (account-lockout risk). One poll cycle.
 RELOGIN_COOLDOWN_S = 900
 
+# Optional marketing opt-in VW shows after login; its "skip" button continues it (#34).
+MARKETING_CONSENT_PATH = "/login/ui/marketing-consent"
+
 
 # VW's 2026 "consent wall" interrupts the still-valid SSO with a consent/terms
 # screen; auto-accepting legal terms is fragile, so we tell the user to clear it.
@@ -139,6 +142,30 @@ def _parse_form(html: str) -> tuple[dict[str, str], str | None]:
             if name:
                 fields[name] = inp.get("value", "")
     return fields, action
+
+
+def _marketing_consent_skip(url: str, html: str) -> tuple[str, dict[str, str]] | None:
+    """(action, form) of the marketing page's "skip" button, or None if ``url`` isn't one."""
+    parsed = urlparse(url)
+    idk = html.find("window._IDK")
+    if not parsed.path.endswith(MARKETING_CONSENT_PATH) or idk < 0:
+        return None
+    try:
+        data = json.JSONDecoder().raw_decode(html, html.index("{", idk))[0]["Data"]
+        form = {
+            f"channel{c['channelId']}": "not_used" if c["channelType"] == "NOT_USED" else "false"
+            for c in data.get("channels", [])
+        }
+        form.update(
+            state=data["state"],
+            relayState=data["relayStateToken"],
+            mdKey=data.get("mdKey", ""),
+            mdLanguage=data.get("mdLanguage", ""),
+        )
+    except (ValueError, KeyError, TypeError, AttributeError) as err:
+        _LOGGER.debug("Could not read VW's marketing consent page: %r", err)
+        return None
+    return parsed._replace(path=parsed.path + "/skip", query="").geturl(), form
 
 
 def _validate_landing(url: str) -> None:
@@ -249,12 +276,31 @@ class WebsitePortalClient:
                 body = await r.text() if status == 200 else ""
             if "/u/mfa-email-challenge" in cur and status == 200:
                 raise _MfaRequired(cur, body)
+            if status == 200 and (skipped := await self._skip_marketing_consent(cur, body)):
+                ref = skipped
+                continue
             if not loc:
                 if status >= 400:
                     raise WebsitePortalError(f"login hop answered HTTP {status}: {cur}")
                 return cur
             ref = urljoin(ref, loc)
         raise WebsitePortalError("too many redirects during login")
+
+    async def _skip_marketing_consent(self, url: str, html: str) -> str | None:
+        """Skip VW's marketing page; returns where the login continues, or None."""
+        skip = _marketing_consent_skip(url, html)
+        if skip is None:
+            return None
+        _LOGGER.debug("Skipping VW's marketing consent page")
+        async with self._session.post(
+            skip[0], data=skip[1], headers={"User-Agent": UA}, allow_redirects=False
+        ) as r:
+            loc = r.headers.get("Location")
+            cur = str(r.url)
+            status = r.status
+        if not loc:
+            raise WebsitePortalError(f"marketing consent skip answered HTTP {status}")
+        return urljoin(cur, loc)
 
     async def begin_login(self) -> str:
         """Start login. Returns 'ok' (logged in) or 'otp_required'."""
@@ -266,6 +312,12 @@ class WebsitePortalClient:
         ) as r:
             page_url = str(r.url)
             status = r.status
+            body = await r.text() if status == 200 else ""
+        try:
+            if resumed := await self._skip_marketing_consent(page_url, body):
+                page_url, status = await self._follow(resumed), 200
+        except _MfaRequired as mfa:
+            return self._await_otp(mfa)
         if "/u/login" not in page_url:
             _validate_landing(page_url)
             if status != 200:
@@ -286,9 +338,12 @@ class WebsitePortalClient:
             _validate_landing(await self._follow(urljoin(cur, loc)))
             return "ok"
         except _MfaRequired as mfa:
-            fields, action = _parse_form(mfa.html)
-            self._mfa = {"page_url": mfa.page_url, "fields": fields, "action": action}
-            return "otp_required"
+            return self._await_otp(mfa)
+
+    def _await_otp(self, mfa: _MfaRequired) -> str:
+        fields, action = _parse_form(mfa.html)
+        self._mfa = {"page_url": mfa.page_url, "fields": fields, "action": action}
+        return "otp_required"
 
     async def submit_otp(self, code: str) -> str:
         if not self._mfa:
@@ -381,6 +436,11 @@ class WebsitePortalClient:
             ) from err
         except aiohttp.ClientError as err:
             raise WebsitePortalError(f"refresh request failed: {err}") from err
+        try:
+            if status == 200 and (resumed := await self._skip_marketing_consent(url, body)):
+                url, status = await self._follow(resumed), 200
+        except _MfaRequired as err:
+            raise WebsitePortalOtpRequired(_OTP_HINT) from err
         _validate_landing(url)
         # Landing on a volkswagen.de URL is necessary but not sufficient: the
         # chain can also terminate on a non-2xx error response (e.g. 412) that
